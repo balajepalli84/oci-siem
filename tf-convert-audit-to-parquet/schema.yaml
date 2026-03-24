@@ -1,0 +1,178 @@
+# Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl.
+
+title: "Log Converter – OCI Function"
+description: "Deploys the log-converter OCI Function that converts SCH-written gzip-JSON audit and flow logs into ZSTD-compressed Parquet files in Object Storage."
+schemaVersion: 1.1.0
+version: "20250322"
+locale: "en"
+
+variableGroups:
+  - title: "General"
+    variables:
+      - compartment_ocid
+      - region
+
+  - title: "Networking"
+    variables:
+      - vcn_ocid
+      - subnet_ocid
+
+  - title: "Container Registry (OCIR)"
+    variables:
+      - ocir_username
+      - ocir_password
+      - repository_name
+
+  - title: "Functions Application"
+    variables:
+      - create_functions_application
+      - app_display_name
+      - existing_application_ocid
+      - function_display_name
+
+  - title: "Parquet Output"
+    description: "Object Storage bucket where the function writes converted Parquet files."
+    variables:
+      - parquet_bucket
+      - parquet_namespace
+
+  - title: "Advanced"
+    variables:
+      - function_memory_in_mbs
+      - function_timeout_in_seconds
+
+  - title: "Internal"
+    visible: false
+    variables:
+      - tenancy_ocid
+      - function_working_dir
+
+variables:
+
+  compartment_ocid:
+    type: oci:identity:compartment:id
+    title: "Compartment"
+    required: true
+
+  region:
+    type: oci:identity:region:name
+    title: "Region"
+    required: true
+    visible: false
+
+  vcn_ocid:
+    type: oci:core:vcn:id
+    title: "Virtual Cloud Network (VCN)"
+    required: true
+    dependsOn:
+      compartmentId: compartment_ocid
+
+  subnet_ocid:
+    type: oci:core:subnet:id
+    title: "Subnet"
+    required: true
+    dependsOn:
+      compartmentId: compartment_ocid
+      vcnId: vcn_ocid
+      vcnCompartmentId: compartment_ocid
+
+  ocir_username:
+    type: string
+    title: "OCIR Username"
+    description: "Format: oracleidentitycloudservice/<email>"
+    required: true
+
+  ocir_password:
+    type: password
+    title: "OCIR Auth Token"
+    description: "Generate under User Settings → Auth Tokens"
+    required: true
+
+  repository_name:
+    type: string
+    title: "OCIR Repository Name"
+    default: "security-lake-repo"
+    required: true
+
+  create_functions_application:
+    type: boolean
+    title: "Create a new Functions Application"
+    description: "Uncheck to use an existing application"
+    default: true
+
+  app_display_name:
+    type: string
+    title: "New Application Name"
+    default: "security-lake-app"
+    visible: create_functions_application
+    required: true
+
+  existing_application_ocid:
+    type: oci:functions:application:id
+    title: "Existing Functions Application"
+    dependsOn:
+      compartmentId: compartment_ocid
+    visible:
+      not:
+        - create_functions_application
+    required: true
+
+  function_display_name:
+    type: string
+    title: "Function Name"
+    default: "log-converter"
+    required: true
+
+  parquet_bucket:
+    type: string
+    title: "Parquet Output Bucket"
+    description: "Object Storage bucket where converted Parquet files are written"
+    default: "Parquet_Security_Lake_Audit_Logs"
+    required: true
+
+  parquet_namespace:
+    type: string
+    title: "Parquet Bucket Namespace"
+    description: "Object Storage namespace for the Parquet bucket. Leave blank to use the tenancy namespace automatically."
+    required: false
+
+  function_memory_in_mbs:
+    type: integer
+    title: "Function Memory (MB)"
+    minimum: 512
+    maximum: 2048
+    default: 1024
+
+  function_timeout_in_seconds:
+    type: integer
+    title: "Function Timeout (seconds)"
+    minimum: 30
+    maximum: 300
+    default: 300
+
+outputs:
+  function_ocid:
+    title: "Function OCID"
+    type: copyableString
+    visible: true
+
+  function_invoke_endpoint:
+    title: "Function Invoke Endpoint"
+    type: link
+    visible: true
+
+  functions_application_id:
+    title: "Functions Application OCID"
+    type: copyableString
+    visible: true
+
+  image_path:
+    title: "OCIR Image Path"
+    type: copyableString
+    visible: true
+
+  object_storage_namespace:
+    title: "Object Storage Namespace"
+    type: copyableString
+    visible: true
