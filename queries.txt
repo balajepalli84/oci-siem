@@ -1,0 +1,1537 @@
+ CREATE TABLE cti_otx_iocs (
+    indicator_type      VARCHAR2(30),
+    indicator_value     VARCHAR2(200),
+    pulse_id            VARCHAR2(100),
+    pulse_name          VARCHAR2(500),
+    description         VARCHAR2(2000),
+    threat_score        NUMBER,
+    first_seen          TIMESTAMP,
+    last_seen           TIMESTAMP,
+    is_active           CHAR(1) DEFAULT 'Y',
+    source_name         VARCHAR2(50) DEFAULT 'OTX',
+    raw_json            CLOB,
+    created_at          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+CREATE UNIQUE INDEX cti_otx_iocs_u1
+ON cti_otx_iocs (indicator_type, indicator_value, pulse_id);
+
+CREATE TABLE audit_new_files (
+    object_name         VARCHAR2(2000) PRIMARY KEY,
+    bytes               NUMBER,
+    checksum            VARCHAR2(200),
+    created_ts          TIMESTAMP,
+    last_modified_ts    TIMESTAMP,
+    processed_flag      CHAR(1) DEFAULT 'N',
+    processed_at        TIMESTAMP,
+    status              VARCHAR2(30),
+    error_message       VARCHAR2(4000)
+);
+
+CREATE TABLE audit_alerts (
+    alert_id            NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alert_time          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    event_time          TIMESTAMP,
+    source_ip           VARCHAR2(100),
+    principal_name      VARCHAR2(500),
+    event_name          VARCHAR2(500),
+    compartment_id      VARCHAR2(200),
+    compartment_name    VARCHAR2(500),
+    response_status     VARCHAR2(50),
+    object_name         VARCHAR2(2000),
+    indicator_value     VARCHAR2(200),
+    indicator_type      VARCHAR2(30),
+    pulse_id            VARCHAR2(100),
+    pulse_name          VARCHAR2(500),
+    severity            VARCHAR2(30),
+    match_reason        VARCHAR2(1000),
+    raw_event           CLOB,
+    created_at          TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+CREATE UNIQUE INDEX audit_alerts_u1
+ON audit_alerts (
+    object_name,
+    source_ip,
+    event_name,
+    pulse_id
+);
+
+CREATE TABLE job_run_log (
+    job_name            VARCHAR2(100),
+    run_time            TIMESTAMP DEFAULT SYSTIMESTAMP,
+    status              VARCHAR2(30),
+    details             VARCHAR2(4000)
+);
+
+CREATE TABLE cti_config (
+    config_key      VARCHAR2(100) PRIMARY KEY,
+    config_value    VARCHAR2(4000),
+    updated_at      TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+/
+INSERT INTO cti_config (config_key, config_value)
+VALUES ('OTX_API_KEY', 'PUT_YOUR_OTX_KEY_HERE');
+/
+
+INSERT INTO cti_config (config_key, config_value)
+VALUES ('OTX_BASE_URL', 'https://otx.alienvault.com/api/v1');
+/
+
+INSERT INTO cti_config (config_key, config_value)
+VALUES ('OTX_LAST_SYNC_UTC', '1970-01-01T00:00:00+00:00');
+/
+-----
+
+SET SERVEROUTPUT ON
+DECLARE
+    l_api_key   VARCHAR2(4000);
+    l_base_url  VARCHAR2(4000);
+    l_headers   VARCHAR2(32767);
+    l_resp      DBMS_CLOUD_TYPES.resp;
+    l_body      CLOB;
+BEGIN
+    SELECT config_value
+    INTO l_api_key
+    FROM cti_config
+    WHERE config_key = 'OTX_API_KEY';
+
+    SELECT config_value
+    INTO l_base_url
+    FROM cti_config
+    WHERE config_key = 'OTX_BASE_URL';
+
+    l_headers := '{"X-OTX-API-KEY":"' || l_api_key || '","User-Agent":"adb-otx-sync/1.0"}';
+
+    l_resp := DBMS_CLOUD.SEND_REQUEST(
+        credential_name => NULL,
+        uri             => l_base_url || '/user/me',
+        method          => DBMS_CLOUD.METHOD_GET,
+        headers         => l_headers
+    );
+
+    DBMS_OUTPUT.PUT_LINE('HTTP status = ' || DBMS_CLOUD.GET_RESPONSE_STATUS_CODE(l_resp));
+
+    l_body := DBMS_CLOUD.GET_RESPONSE_TEXT(l_resp);
+    DBMS_OUTPUT.PUT_LINE(DBMS_LOB.SUBSTR(l_body, 4000, 1));
+END;
+/
+
+CREATE TABLE cti_otx_iocs (
+    indicator_type      VARCHAR2(30),
+    indicator_value     VARCHAR2(200),
+    pulse_id            VARCHAR2(100),
+    pulse_name          VARCHAR2(500),
+    description         VARCHAR2(2000),
+    threat_score        NUMBER,
+    first_seen          TIMESTAMP,
+    last_seen           TIMESTAMP WITH TIME ZONE,
+    is_active           CHAR(1) DEFAULT 'Y',
+    source_name         VARCHAR2(50) DEFAULT 'OTX',
+    raw_json            CLOB,
+    created_at          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+/
+CREATE UNIQUE INDEX cti_otx_iocs_u1
+ON cti_otx_iocs (indicator_type, indicator_value, pulse_id);
+/
+CREATE TABLE job_run_log (
+    job_name    VARCHAR2(100),
+    run_time    TIMESTAMP DEFAULT SYSTIMESTAMP,
+    status      VARCHAR2(30),
+    details     VARCHAR2(4000)
+);
+/
+
+CREATE OR REPLACE PACKAGE cti_otx_pkg AS
+    PROCEDURE sync_ipv4_iocs;
+END cti_otx_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY cti_otx_pkg AS
+
+    FUNCTION get_config(p_key IN VARCHAR2) RETURN VARCHAR2 IS
+        l_val VARCHAR2(4000);
+    BEGIN
+        SELECT config_value
+        INTO l_val
+        FROM cti_config
+        WHERE config_key = p_key;
+
+        RETURN l_val;
+    END;
+
+    PROCEDURE log_run(p_status IN VARCHAR2, p_details IN VARCHAR2) IS
+    BEGIN
+        INSERT INTO job_run_log(job_name, status, details)
+        VALUES ('OTX_SYNC', p_status, SUBSTR(p_details, 1, 4000));
+        COMMIT;
+    END;
+
+    PROCEDURE sync_ipv4_iocs IS
+        l_api_key    VARCHAR2(4000);
+        l_base_url   VARCHAR2(4000);
+        l_headers    VARCHAR2(32767);
+        l_resp       DBMS_CLOUD_TYPES.resp;
+        l_body       CLOB;
+        l_rows       NUMBER := 0;
+    BEGIN
+        l_api_key  := get_config('OTX_API_KEY');
+        l_base_url := get_config('OTX_BASE_URL');
+
+        l_headers := '{"X-OTX-API-KEY":"' || l_api_key || '"}';
+
+        l_resp := DBMS_CLOUD.SEND_REQUEST(
+            credential_name => NULL,
+            uri             => l_base_url || '/pulses/subscribed?limit=20&page=1',
+            method          => DBMS_CLOUD.METHOD_GET,
+            headers         => l_headers
+        );
+
+        IF DBMS_CLOUD.GET_RESPONSE_STATUS_CODE(l_resp) <> 200 THEN
+            RAISE_APPLICATION_ERROR(
+                -20001,
+                'OTX HTTP error: ' || DBMS_CLOUD.GET_RESPONSE_STATUS_CODE(l_resp)
+            );
+        END IF;
+
+        l_body := DBMS_CLOUD.GET_RESPONSE_TEXT(l_resp);
+
+        INSERT INTO cti_otx_iocs (
+            indicator_type,
+            indicator_value,
+            pulse_id,
+            pulse_name,
+            description,
+            threat_score,
+            first_seen,
+            last_seen,
+            is_active,
+            source_name,
+            raw_json,
+            created_at,
+            updated_at
+        )
+        SELECT
+            jt.indicator_type,
+            jt.indicator_value,
+            jt.pulse_id,
+            jt.pulse_name,
+            jt.pulse_desc,
+            50,
+            SYSTIMESTAMP,
+            SYSTIMESTAMP,
+            'Y',
+            'OTX',
+            l_body,
+            SYSTIMESTAMP,
+            SYSTIMESTAMP
+        FROM JSON_TABLE(
+            l_body,
+            '$.results[*]'
+            COLUMNS (
+                pulse_id   VARCHAR2(100)  PATH '$.id',
+                pulse_name VARCHAR2(500)  PATH '$.name',
+                pulse_desc VARCHAR2(2000) PATH '$.description',
+                NESTED PATH '$.indicators[*]'
+                COLUMNS (
+                    indicator_type  VARCHAR2(50)  PATH '$.type',
+                    indicator_value VARCHAR2(200) PATH '$.indicator'
+                )
+            )
+        ) jt
+        WHERE jt.indicator_type = 'IPv4'
+          AND jt.indicator_value IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM cti_otx_iocs t
+              WHERE t.indicator_type  = jt.indicator_type
+                AND t.indicator_value = jt.indicator_value
+                AND t.pulse_id        = jt.pulse_id
+          );
+
+        l_rows := SQL%ROWCOUNT;
+
+        COMMIT;
+
+        log_run('SUCCESS', 'Inserted IPv4 IOC rows = ' || l_rows);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            log_run('FAILED', SQLERRM);
+            RAISE;
+    END sync_ipv4_iocs;
+
+END cti_otx_pkg;
+/
+/
+
+BEGIN
+    cti_otx_pkg.sync_ipv4_iocs;
+END;
+/
+
+
+CREATE TABLE audit_alerts (
+    alert_id            NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alert_time          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    event_time          TIMESTAMP,
+    source_ip           VARCHAR2(100),
+    principal_name      VARCHAR2(500),
+    event_name          VARCHAR2(500),
+    compartment_id      VARCHAR2(200),
+    compartment_name    VARCHAR2(500),
+    response_status     VARCHAR2(50),
+    source_file         VARCHAR2(2000),
+    indicator_value     VARCHAR2(200),
+    indicator_type      VARCHAR2(30),
+    pulse_id            VARCHAR2(100),
+    pulse_name          VARCHAR2(500),
+    severity            VARCHAR2(30),
+    match_reason        VARCHAR2(1000),
+    raw_event           CLOB,
+    created_at          TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+/
+
+CREATE UNIQUE INDEX audit_alerts_u1
+ON audit_alerts (
+    source_file,
+    source_ip,
+    event_name,
+    pulse_id
+);
+/
+CREATE TABLE audit_new_files (
+    object_name         VARCHAR2(2000) PRIMARY KEY,
+    bytes               NUMBER,
+    checksum            VARCHAR2(200),
+    created_ts          TIMESTAMP,
+    last_modified_ts    TIMESTAMP,
+    processed_flag      CHAR(1) DEFAULT 'N',
+    processed_at        TIMESTAMP,
+    status              VARCHAR2(30),
+    error_message       VARCHAR2(4000)
+);
+/
+INSERT INTO audit_new_files (
+    object_name,
+    bytes,
+    checksum,
+    created_ts,
+    last_modified_ts,
+    processed_flag,
+    status
+)
+SELECT
+    object_name,
+    bytes,
+    checksum,
+    created,
+    last_modified,
+    'N',
+    'DISCOVERED'
+FROM DBMS_CLOUD.LIST_OBJECTS(
+    credential_name => 'OCI$RESOURCE_PRINCIPAL',
+    location_uri    => 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Audit_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa7ztfxb6pj44axmaijf32p3wb5pdh4nohryxhkbmzktca/'
+) l
+WHERE l.object_name LIKE '%.log.gz'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM audit_new_files f
+      WHERE f.object_name = l.object_name
+  );
+/
+
+BEGIN
+    DBMS_CLOUD.CREATE_EXTERNAL_TABLE(
+        table_name      => 'AUDIT_LOG_ONE_EXT',
+        credential_name => 'OCI$RESOURCE_PRINCIPAL',
+        file_uri_list   => 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Audit_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa7ztfxb6pj44axmaijf32p3wb5pdh4nohryxhkbmzktca/20260324T021117Z_20260324T021832Z.0.log.gz',
+        column_list     => 'raw_line VARCHAR2(32767)',
+        field_list      => 'raw_line CHAR(32767)',
+        format          => json_object(
+                              'delimiter'       VALUE '0x''01''',
+                              'recorddelimiter' VALUE '''\n''',
+                              'compression'     VALUE 'gzip'
+                           )
+    );
+END;
+/
+
+CREATE OR REPLACE PROCEDURE PROCESS_AUDIT_FILE (
+    p_file_name IN VARCHAR2
+)
+AS
+BEGIN
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+
+  DBMS_CLOUD.CREATE_EXTERNAL_TABLE(
+      table_name      => 'AUDIT_LOG_ONE_EXT',
+      credential_name => 'OCI$RESOURCE_PRINCIPAL',
+      file_uri_list   => p_file_name,
+      column_list     => 'raw_line VARCHAR2(32767)',
+      field_list      => 'raw_line CHAR(32767)',
+      format          => json_object(
+          'delimiter'       VALUE '0x''01''',
+          'recorddelimiter' VALUE '''\n''',
+          'compression'     VALUE 'gzip'
+      )
+  );
+
+  EXECUTE IMMEDIATE q'[
+    INSERT INTO AUDIT_ALERTS (
+        source_ip,
+        event_time,
+        event_name,
+        principal_name,
+        compartment_id,
+        compartment_name,
+        resource_name,
+        ioc_value,
+        ioc_type,
+        pulse_name,
+        severity,
+        raw_event
+    )
+    SELECT
+        JSON_VALUE(raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR),
+        CAST(
+          TO_TIMESTAMP_TZ(
+            JSON_VALUE(raw_line, '$.datetime' RETURNING VARCHAR2(100) NULL ON ERROR),
+            'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+          ) AS TIMESTAMP
+        ),
+        JSON_VALUE(raw_line, '$.data.eventName' RETURNING VARCHAR2(4000) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.identity.principalName' RETURNING VARCHAR2(4000) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.compartmentId' RETURNING VARCHAR2(4000) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.compartmentName' RETURNING VARCHAR2(4000) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.resourceName' RETURNING VARCHAR2(4000) NULL ON ERROR),
+        c.indicator,
+        c.indicator_type,
+        c.pulse_name,
+        CASE
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%MALWARE%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BOTNET%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%C2%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%SCANNER%' THEN 'MEDIUM'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BRUTE%' THEN 'MEDIUM'
+          ELSE 'LOW'
+        END,
+        raw_line
+    FROM AUDIT_LOG_ONE_EXT e
+    JOIN CTI_OTX_IOCS c
+      ON c.indicator_type = 'IPv4'
+     AND c.indicator = JSON_VALUE(e.raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR)
+    WHERE JSON_VALUE(e.raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR) IS NOT NULL
+  ]';
+
+  COMMIT;
+
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+END;
+/
+CREATE OR REPLACE PROCEDURE PROCESS_AUDIT_FILE (
+    p_file_name IN VARCHAR2
+)
+AS
+BEGIN
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+
+  DBMS_CLOUD.CREATE_EXTERNAL_TABLE(
+      table_name      => 'AUDIT_LOG_ONE_EXT',
+      credential_name => 'OCI$RESOURCE_PRINCIPAL',
+      file_uri_list   => p_file_name,
+      column_list     => 'raw_line VARCHAR2(32767)',
+      field_list      => 'raw_line CHAR(32767)',
+      format          => json_object(
+          'delimiter'       VALUE '0x''01''',
+          'recorddelimiter' VALUE '''\n''',
+          'compression'     VALUE 'gzip'
+      )
+  );
+
+  EXECUTE IMMEDIATE q'[
+    INSERT INTO AUDIT_ALERTS (
+        ALERT_TIME,
+        EVENT_TIME,
+        SOURCE_IP,
+        PRINCIPAL_NAME,
+        EVENT_NAME,
+        COMPARTMENT_ID,
+        COMPARTMENT_NAME,
+        RESPONSE_STATUS,
+        OBJECT_NAME,
+        INDICATOR_VALUE,
+        INDICATOR_TYPE,
+        PULSE_ID,
+        PULSE_NAME,
+        SEVERITY,
+        MATCH_REASON,
+        RAW_EVENT,
+        CREATED_AT
+    )
+    SELECT
+        SYSTIMESTAMP,
+        CAST(
+          TO_TIMESTAMP_TZ(
+            JSON_VALUE(raw_line, '$.datetime' RETURNING VARCHAR2(100) NULL ON ERROR),
+            'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+          ) AS TIMESTAMP
+        ),
+        JSON_VALUE(raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.identity.principalName' RETURNING VARCHAR2(500) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.eventName' RETURNING VARCHAR2(500) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.compartmentId' RETURNING VARCHAR2(200) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.compartmentName' RETURNING VARCHAR2(500) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.response.status' RETURNING VARCHAR2(50) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.request.path' RETURNING VARCHAR2(2000) NULL ON ERROR),
+        c.indicator_value,
+        c.indicator_type,
+        c.pulse_id,
+        c.pulse_name,
+        CASE
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%MALWARE%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BOTNET%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%C2%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%SCANNER%' THEN 'MEDIUM'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BRUTE%' THEN 'MEDIUM'
+          ELSE 'LOW'
+        END,
+        'Matched source IP from audit log to OTX IPv4 IOC',
+        raw_line,
+        SYSTIMESTAMP
+    FROM AUDIT_LOG_ONE_EXT e
+    JOIN CTI_OTX_IOCS c
+      ON c.indicator_type = 'IPv4'
+     AND c.indicator_value = JSON_VALUE(e.raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR)
+    WHERE JSON_VALUE(e.raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR) IS NOT NULL
+  ]';
+
+  COMMIT;
+
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+END;
+/
+
+BEGIN
+  PROCESS_AUDIT_FILE(
+    'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Audit_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa7ztfxb6pj44axmaijf32p3wb5pdh4nohryxhkbmzktca/20260324T021117Z_20260324T021832Z.0.log.gz'
+  );
+END;
+/
+CREATE OR REPLACE PROCEDURE DISCOVER_AUDIT_FILES
+AS
+  v_base_uri VARCHAR2(4000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Audit_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa7ztfxb6pj44axmaijf32p3wb5pdh4nohryxhkbmzktca/';
+BEGIN
+  INSERT INTO AUDIT_NEW_FILES (
+      OBJECT_NAME,
+      BYTES,
+      CHECKSUM,
+      CREATED_TS,
+      LAST_MODIFIED_TS,
+      PROCESSED_FLAG,
+      STATUS
+  )
+  SELECT
+      object_name,
+      bytes,
+      checksum,
+      CAST(created AS TIMESTAMP),
+      CAST(last_modified AS TIMESTAMP),
+      'N',
+      'NEW'
+  FROM DBMS_CLOUD.LIST_OBJECTS(
+         credential_name => 'OCI$RESOURCE_PRINCIPAL',
+         location_uri    => v_base_uri
+       )
+  WHERE object_name LIKE '%.log.gz'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM AUDIT_NEW_FILES a
+      WHERE a.OBJECT_NAME = object_name
+    );
+
+  COMMIT;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE PROCESS_AUDIT_FILE (
+    p_object_name IN VARCHAR2
+)
+AS
+  v_base_uri   VARCHAR2(4000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Audit_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa7ztfxb6pj44axmaijf32p3wb5pdh4nohryxhkbmzktca/';
+  v_file_uri   VARCHAR2(4000);
+  v_error_msg  VARCHAR2(4000);
+BEGIN
+  v_file_uri := v_base_uri || REPLACE(p_object_name, ' ', '%20');
+
+  UPDATE AUDIT_NEW_FILES
+  SET STATUS = 'PROCESSING'
+  WHERE OBJECT_NAME = p_object_name;
+
+  COMMIT;
+
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+
+  DBMS_CLOUD.CREATE_EXTERNAL_TABLE(
+      table_name      => 'AUDIT_LOG_ONE_EXT',
+      credential_name => 'OCI$RESOURCE_PRINCIPAL',
+      file_uri_list   => v_file_uri,
+      column_list     => 'raw_line VARCHAR2(32767)',
+      field_list      => 'raw_line CHAR(32767)',
+      format          => json_object(
+          'delimiter'       VALUE '0x''01''',
+          'recorddelimiter' VALUE '''\n''',
+          'compression'     VALUE 'gzip'
+      )
+  );
+
+  EXECUTE IMMEDIATE q'[
+    INSERT INTO AUDIT_ALERTS (
+        ALERT_TIME,
+        EVENT_TIME,
+        SOURCE_IP,
+        PRINCIPAL_NAME,
+        EVENT_NAME,
+        COMPARTMENT_ID,
+        COMPARTMENT_NAME,
+        RESPONSE_STATUS,
+        OBJECT_NAME,
+        INDICATOR_VALUE,
+        INDICATOR_TYPE,
+        PULSE_ID,
+        PULSE_NAME,
+        SEVERITY,
+        MATCH_REASON,
+        RAW_EVENT,
+        CREATED_AT
+    )
+    SELECT
+        SYSTIMESTAMP,
+        CAST(
+          TO_TIMESTAMP_TZ(
+            JSON_VALUE(raw_line, '$.datetime' RETURNING VARCHAR2(100) NULL ON ERROR),
+            'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+          ) AS TIMESTAMP
+        ),
+        JSON_VALUE(raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.identity.principalName' RETURNING VARCHAR2(500) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.eventName' RETURNING VARCHAR2(500) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.compartmentId' RETURNING VARCHAR2(200) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.compartmentName' RETURNING VARCHAR2(500) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.response.status' RETURNING VARCHAR2(50) NULL ON ERROR),
+        JSON_VALUE(raw_line, '$.data.request.path' RETURNING VARCHAR2(2000) NULL ON ERROR),
+        c.indicator_value,
+        c.indicator_type,
+        c.pulse_id,
+        c.pulse_name,
+        CASE
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%MALWARE%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BOTNET%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%C2%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%SCANNER%' THEN 'MEDIUM'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BRUTE%' THEN 'MEDIUM'
+          ELSE 'LOW'
+        END,
+        'Matched source IP from audit log to OTX IPv4 IOC',
+        raw_line,
+        SYSTIMESTAMP
+    FROM AUDIT_LOG_ONE_EXT e
+    JOIN CTI_OTX_IOCS c
+      ON c.indicator_type = 'IPv4'
+     AND c.indicator_value = JSON_VALUE(e.raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR)
+    WHERE JSON_VALUE(e.raw_line, '$.data.identity.ipAddress' RETURNING VARCHAR2(100) NULL ON ERROR) IS NOT NULL
+  ]';
+
+  UPDATE AUDIT_NEW_FILES
+  SET PROCESSED_FLAG = 'Y',
+      PROCESSED_AT   = SYSTIMESTAMP,
+      STATUS         = 'PROCESSED',
+      ERROR_MESSAGE  = NULL
+  WHERE OBJECT_NAME = p_object_name;
+
+  COMMIT;
+
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    v_error_msg := SUBSTR(SQLERRM, 1, 4000);
+
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE AUDIT_LOG_ONE_EXT PURGE';
+    EXCEPTION
+      WHEN OTHERS THEN NULL;
+    END;
+
+    UPDATE AUDIT_NEW_FILES
+    SET PROCESSED_FLAG = 'E',
+        PROCESSED_AT   = SYSTIMESTAMP,
+        STATUS         = 'ERROR',
+        ERROR_MESSAGE  = v_error_msg
+    WHERE OBJECT_NAME = p_object_name;
+
+    COMMIT;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE PROCESS_ALL_AUDIT_FILES
+AS
+BEGIN
+  FOR r IN (
+      SELECT OBJECT_NAME
+      FROM AUDIT_NEW_FILES
+      WHERE NVL(PROCESSED_FLAG, 'N') <> 'Y'
+      ORDER BY LAST_MODIFIED_TS, OBJECT_NAME
+  )
+  LOOP
+    BEGIN
+      PROCESS_AUDIT_FILE(r.OBJECT_NAME);
+    EXCEPTION
+      WHEN OTHERS THEN
+        NULL;
+    END;
+  END LOOP;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE RUN_AUDIT_PIPELINE
+AS
+BEGIN
+  DISCOVER_AUDIT_FILES;
+  PROCESS_ALL_AUDIT_FILES;
+END;
+/
+BEGIN
+  RUN_AUDIT_PIPELINE;
+END;
+/
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB (
+    job_name        => 'AUDIT_PIPELINE_JOB',
+    job_type        => 'STORED_PROCEDURE',
+    job_action      => 'RUN_AUDIT_PIPELINE',
+    start_date      => SYSTIMESTAMP,
+    repeat_interval => 'FREQ=MINUTELY;INTERVAL=15',
+    enabled         => TRUE,
+    comments        => 'Discover and process OCI audit log files'
+  );
+END;
+/
+
+--------Flow logs Code----------------
+request.principal.type='serviceconnector'
+
+CREATE TABLE flow_new_files (
+    object_name         VARCHAR2(2000) PRIMARY KEY,
+    bytes               NUMBER,
+    checksum            VARCHAR2(200),
+    created_ts          TIMESTAMP,
+    last_modified_ts    TIMESTAMP,
+    processed_flag      CHAR(1) DEFAULT 'N',
+    processed_at        TIMESTAMP,
+    status              VARCHAR2(30),
+    error_message       VARCHAR2(4000)
+);
+/
+
+CREATE TABLE flow_alerts (
+    alert_id            NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alert_time          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    event_time          TIMESTAMP,
+    src_ip              VARCHAR2(100),
+    dst_ip              VARCHAR2(100),
+    src_port            NUMBER,
+    dst_port            NUMBER,
+    protocol            VARCHAR2(50),
+    action              VARCHAR2(50),
+    vnic_ocid           VARCHAR2(200),
+    subnet_id           VARCHAR2(200),
+    compartment_id      VARCHAR2(200),
+    log_status          VARCHAR2(100),
+    object_name         VARCHAR2(2000),
+    indicator_value     VARCHAR2(200),
+    indicator_type      VARCHAR2(30),
+    pulse_id            VARCHAR2(100),
+    pulse_name          VARCHAR2(500),
+    severity            VARCHAR2(30),
+    match_reason        VARCHAR2(1000),
+    raw_event           CLOB,
+    created_at          TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+/
+
+CREATE UNIQUE INDEX flow_alerts_u1
+ON flow_alerts (
+    object_name,
+    src_ip,
+    dst_ip,
+    NVL(pulse_id, 'NO_PULSE')
+);
+/
+
+CREATE OR REPLACE PROCEDURE DISCOVER_FLOW_FILES
+AS
+  v_base_uri VARCHAR2(4000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Flow_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa2hxjhxuvfhtjelxsxc6mpklssrt462z3gdffivmcfdsa/';
+BEGIN
+  INSERT INTO FLOW_NEW_FILES (
+      OBJECT_NAME,
+      BYTES,
+      CHECKSUM,
+      CREATED_TS,
+      LAST_MODIFIED_TS,
+      PROCESSED_FLAG,
+      STATUS
+  )
+  SELECT
+      object_name,
+      bytes,
+      checksum,
+      CAST(created AS TIMESTAMP),
+      CAST(last_modified AS TIMESTAMP),
+      'N',
+      'NEW'
+  FROM DBMS_CLOUD.LIST_OBJECTS(
+         credential_name => 'OCI$RESOURCE_PRINCIPAL',
+         location_uri    => v_base_uri
+       )
+  WHERE object_name LIKE '%.log.gz'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM FLOW_NEW_FILES f
+      WHERE f.OBJECT_NAME = object_name
+    );
+
+  COMMIT;
+END;
+/
+
+BEGIN
+  DISCOVER_FLOW_FILES;
+END;
+/
+
+--validation query
+SELECT object_name, status, processed_flag, last_modified_ts
+FROM flow_new_files
+ORDER BY last_modified_ts DESC;
+/
+
+CREATE OR REPLACE PROCEDURE PROCESS_FLOW_FILE (
+    p_object_name IN VARCHAR2
+)
+AS
+  v_base_uri   VARCHAR2(4000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/ociateam/b/Security_Lake_Flow_Logs/o/ocid1.serviceconnector.oc1.iad.amaaaaaac3adhhqa2hxjhxuvfhtjelxsxc6mpklssrt462z3gdffivmcfdsa/';
+  v_file_uri   VARCHAR2(4000);
+  v_error_msg  VARCHAR2(4000);
+BEGIN
+  v_file_uri := v_base_uri || REPLACE(p_object_name, ' ', '%20');
+
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE FLOW_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+
+  DBMS_CLOUD.CREATE_EXTERNAL_TABLE(
+      table_name      => 'FLOW_LOG_ONE_EXT',
+      credential_name => 'OCI$RESOURCE_PRINCIPAL',
+      file_uri_list   => v_file_uri,
+      column_list     => 'raw_line VARCHAR2(32767)',
+      field_list      => 'raw_line CHAR(32767)',
+      format          => json_object(
+          'delimiter'       VALUE '0x''01''',
+          'recorddelimiter' VALUE '''\n''',
+          'compression'     VALUE 'gzip'
+      )
+  );
+
+  EXECUTE IMMEDIATE q'[
+    INSERT INTO FLOW_ALERTS (
+        ALERT_TIME,
+        EVENT_TIME,
+        SRC_IP,
+        DST_IP,
+        SRC_PORT,
+        DST_PORT,
+        PROTOCOL,
+        ACTION,
+        VNIC_OCID,
+        SUBNET_ID,
+        COMPARTMENT_ID,
+        LOG_STATUS,
+        OBJECT_NAME,
+        INDICATOR_VALUE,
+        INDICATOR_TYPE,
+        PULSE_ID,
+        PULSE_NAME,
+        SEVERITY,
+        MATCH_REASON,
+        RAW_EVENT,
+        CREATED_AT
+    )
+    SELECT
+        SYSTIMESTAMP,
+        CAST(
+          TO_TIMESTAMP_TZ(
+            JSON_VALUE(e.raw_line, '$.datetime' RETURNING VARCHAR2(100) NULL ON ERROR),
+            'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+          ) AS TIMESTAMP
+        ) AS event_time,
+        JSON_VALUE(e.raw_line, '$.data.sourceAddress' RETURNING VARCHAR2(100) NULL ON ERROR) AS src_ip,
+        JSON_VALUE(e.raw_line, '$.data.destinationAddress' RETURNING VARCHAR2(100) NULL ON ERROR) AS dst_ip,
+        JSON_VALUE(e.raw_line, '$.data.sourcePort' RETURNING NUMBER NULL ON ERROR) AS src_port,
+        JSON_VALUE(e.raw_line, '$.data.destinationPort' RETURNING NUMBER NULL ON ERROR) AS dst_port,
+        JSON_VALUE(e.raw_line, '$.data.protocol' RETURNING VARCHAR2(50) NULL ON ERROR) AS protocol,
+        JSON_VALUE(e.raw_line, '$.data.action' RETURNING VARCHAR2(50) NULL ON ERROR) AS action,
+        JSON_VALUE(e.raw_line, '$.data.vnicId' RETURNING VARCHAR2(200) NULL ON ERROR) AS vnic_ocid,
+        JSON_VALUE(e.raw_line, '$.data.subnetId' RETURNING VARCHAR2(200) NULL ON ERROR) AS subnet_id,
+        JSON_VALUE(e.raw_line, '$.data.compartmentId' RETURNING VARCHAR2(200) NULL ON ERROR) AS compartment_id,
+        JSON_VALUE(e.raw_line, '$.data.status' RETURNING VARCHAR2(100) NULL ON ERROR) AS log_status,
+        :1,
+        c.indicator_value,
+        c.indicator_type,
+        c.pulse_id,
+        c.pulse_name,
+        CASE
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%MALWARE%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BOTNET%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%C2%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%SCANNER%' THEN 'MEDIUM'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BRUTE%' THEN 'MEDIUM'
+          ELSE 'LOW'
+        END,
+        'Matched source IP from flow log to OTX IPv4 IOC',
+        e.raw_line,
+        SYSTIMESTAMP
+    FROM FLOW_LOG_ONE_EXT e
+    JOIN CTI_OTX_IOCS c
+      ON c.indicator_type = 'IPv4'
+     AND c.indicator_value = JSON_VALUE(e.raw_line, '$.data.sourceAddress' RETURNING VARCHAR2(100) NULL ON ERROR)
+    WHERE JSON_VALUE(e.raw_line, '$.data.sourceAddress' RETURNING VARCHAR2(100) NULL ON ERROR) IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        SYSTIMESTAMP,
+        CAST(
+          TO_TIMESTAMP_TZ(
+            JSON_VALUE(e.raw_line, '$.datetime' RETURNING VARCHAR2(100) NULL ON ERROR),
+            'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'
+          ) AS TIMESTAMP
+        ) AS event_time,
+        JSON_VALUE(e.raw_line, '$.data.sourceAddress' RETURNING VARCHAR2(100) NULL ON ERROR) AS src_ip,
+        JSON_VALUE(e.raw_line, '$.data.destinationAddress' RETURNING VARCHAR2(100) NULL ON ERROR) AS dst_ip,
+        JSON_VALUE(e.raw_line, '$.data.sourcePort' RETURNING NUMBER NULL ON ERROR) AS src_port,
+        JSON_VALUE(e.raw_line, '$.data.destinationPort' RETURNING NUMBER NULL ON ERROR) AS dst_port,
+        JSON_VALUE(e.raw_line, '$.data.protocol' RETURNING VARCHAR2(50) NULL ON ERROR) AS protocol,
+        JSON_VALUE(e.raw_line, '$.data.action' RETURNING VARCHAR2(50) NULL ON ERROR) AS action,
+        JSON_VALUE(e.raw_line, '$.data.vnicId' RETURNING VARCHAR2(200) NULL ON ERROR) AS vnic_ocid,
+        JSON_VALUE(e.raw_line, '$.data.subnetId' RETURNING VARCHAR2(200) NULL ON ERROR) AS subnet_id,
+        JSON_VALUE(e.raw_line, '$.data.compartmentId' RETURNING VARCHAR2(200) NULL ON ERROR) AS compartment_id,
+        JSON_VALUE(e.raw_line, '$.data.status' RETURNING VARCHAR2(100) NULL ON ERROR) AS log_status,
+        :1,
+        c.indicator_value,
+        c.indicator_type,
+        c.pulse_id,
+        c.pulse_name,
+        CASE
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%MALWARE%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BOTNET%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%C2%' THEN 'HIGH'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%SCANNER%' THEN 'MEDIUM'
+          WHEN UPPER(NVL(c.pulse_name,' ')) LIKE '%BRUTE%' THEN 'MEDIUM'
+          ELSE 'LOW'
+        END,
+        'Matched destination IP from flow log to OTX IPv4 IOC',
+        e.raw_line,
+        SYSTIMESTAMP
+    FROM FLOW_LOG_ONE_EXT e
+    JOIN CTI_OTX_IOCS c
+      ON c.indicator_type = 'IPv4'
+     AND c.indicator_value = JSON_VALUE(e.raw_line, '$.data.destinationAddress' RETURNING VARCHAR2(100) NULL ON ERROR)
+    WHERE JSON_VALUE(e.raw_line, '$.data.destinationAddress' RETURNING VARCHAR2(100) NULL ON ERROR) IS NOT NULL
+  ]' USING p_object_name, p_object_name;
+
+  UPDATE FLOW_NEW_FILES
+  SET PROCESSED_FLAG = 'Y',
+      PROCESSED_AT   = SYSTIMESTAMP,
+      STATUS         = 'PROCESSED',
+      ERROR_MESSAGE  = NULL
+  WHERE OBJECT_NAME = p_object_name;
+
+  COMMIT;
+
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE FLOW_LOG_ONE_EXT PURGE';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+        RAISE;
+      END IF;
+  END;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    v_error_msg := SUBSTR(SQLERRM, 1, 4000);
+
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE FLOW_LOG_ONE_EXT PURGE';
+    EXCEPTION
+      WHEN OTHERS THEN NULL;
+    END;
+
+    UPDATE FLOW_NEW_FILES
+    SET PROCESSED_FLAG = 'E',
+        PROCESSED_AT   = SYSTIMESTAMP,
+        STATUS         = 'ERROR',
+        ERROR_MESSAGE  = v_error_msg
+    WHERE OBJECT_NAME = p_object_name;
+
+    COMMIT;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE PROCESS_ALL_FLOW_FILES
+AS
+BEGIN
+  FOR r IN (
+      SELECT OBJECT_NAME
+      FROM FLOW_NEW_FILES
+      WHERE NVL(PROCESSED_FLAG, 'N') <> 'Y'
+      ORDER BY LAST_MODIFIED_TS, OBJECT_NAME
+  )
+  LOOP
+    BEGIN
+      PROCESS_FLOW_FILE(r.OBJECT_NAME);
+    EXCEPTION
+      WHEN OTHERS THEN
+        NULL;
+    END;
+  END LOOP;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE RUN_FLOW_PIPELINE
+AS
+BEGIN
+  DISCOVER_FLOW_FILES;
+  PROCESS_ALL_FLOW_FILES;
+END;
+/
+BEGIN
+  RUN_FLOW_PIPELINE;
+END;
+/
+
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB (
+    job_name        => 'FLOW_PIPELINE_JOB',
+    job_type        => 'STORED_PROCEDURE',
+    job_action      => 'RUN_FLOW_PIPELINE',
+    start_date      => SYSTIMESTAMP,
+    repeat_interval => 'FREQ=MINUTELY;INTERVAL=30',
+    enabled         => TRUE,
+    comments        => 'Discover and process OCI flow log files every 30 minutes'
+  );
+END;
+/
+--add more threat sources
+
+-- Main IOC table
+CREATE TABLE cti_iocs (
+    ioc_id            NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    indicator_type    VARCHAR2(30)   NOT NULL,
+    indicator_value   VARCHAR2(200)  NOT NULL,
+    source_name       VARCHAR2(100)  NOT NULL,
+    source_key        VARCHAR2(300)  NOT NULL,
+    pulse_id          VARCHAR2(200),
+    pulse_name        VARCHAR2(500),
+    description       VARCHAR2(4000),
+    threat_score      NUMBER,
+    first_seen        TIMESTAMP,
+    last_seen         TIMESTAMP,
+    is_active         CHAR(1) DEFAULT 'Y' CHECK (is_active IN ('Y','N')),
+    raw_json          CLOB CHECK (raw_json IS JSON),
+    created_at        TIMESTAMP DEFAULT SYSTIMESTAMP,
+    updated_at        TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+CREATE UNIQUE INDEX cti_iocs_u1
+    ON cti_iocs(source_name, source_key);
+
+CREATE INDEX cti_iocs_n1
+    ON cti_iocs(indicator_value, indicator_type, is_active);
+
+-- Config table
+CREATE TABLE cti_config (
+    config_key     VARCHAR2(200) PRIMARY KEY,
+    config_value   VARCHAR2(4000) NOT NULL
+);
+
+
+
+
+MERGE INTO cti_config t
+USING (
+    SELECT 'THREATFOX_AUTH_KEY' AS config_key,
+           'PASTE_YOUR_AUTH_KEY_HERE' AS config_value
+    FROM dual
+) s
+ON (t.config_key = s.config_key)
+WHEN MATCHED THEN
+    UPDATE SET t.config_value = s.config_value
+WHEN NOT MATCHED THEN
+    INSERT (config_key, config_value)
+    VALUES (s.config_key, s.config_value);
+
+UPDATE cti_config
+SET    config_value = '7'
+WHERE  config_key = 'THREATFOX_DAYS';
+
+COMMIT;
+
+CREATE OR REPLACE PACKAGE BODY cti_abusech_pkg AS
+
+    FUNCTION get_config(p_key IN VARCHAR2) RETURN VARCHAR2 IS
+        l_val VARCHAR2(4000);
+    BEGIN
+        SELECT config_value
+        INTO   l_val
+        FROM   cti_config
+        WHERE  config_key = p_key;
+
+        RETURN l_val;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20001, 'Missing config key: ' || p_key);
+    END get_config;
+
+    PROCEDURE write_log(
+        p_job_name       IN VARCHAR2,
+        p_source_name    IN VARCHAR2,
+        p_status         IN VARCHAR2,
+        p_rows_processed IN NUMBER,
+        p_details        IN VARCHAR2
+    ) IS
+    BEGIN
+        INSERT INTO cti_job_log (
+            job_name, source_name, status, rows_processed, details
+        )
+        VALUES (
+            p_job_name,
+            p_source_name,
+            p_status,
+            p_rows_processed,
+            SUBSTR(p_details, 1, 4000)
+        );
+        COMMIT;
+    END write_log;
+
+    FUNCTION get_http_clob(
+        p_url         IN VARCHAR2,
+        p_method      IN VARCHAR2,
+        p_contenttype IN VARCHAR2 DEFAULT NULL,
+        p_payload     IN CLOB DEFAULT NULL,
+        p_auth_key    IN VARCHAR2 DEFAULT NULL
+    ) RETURN CLOB IS
+        l_req      UTL_HTTP.req;
+        l_resp     UTL_HTTP.resp;
+        l_buffer   VARCHAR2(32767);
+        l_body     CLOB;
+    BEGIN
+        UTL_HTTP.SET_WALLET('');
+
+        l_req := UTL_HTTP.BEGIN_REQUEST(p_url, p_method, 'HTTP/1.1');
+
+        UTL_HTTP.SET_HEADER(l_req, 'User-Agent', 'Oracle-ADB-CTI-Loader/1.0');
+        UTL_HTTP.SET_HEADER(l_req, 'Accept', 'application/json');
+
+        IF p_contenttype IS NOT NULL THEN
+            UTL_HTTP.SET_HEADER(l_req, 'Content-Type', p_contenttype);
+        END IF;
+
+        IF p_auth_key IS NOT NULL THEN
+            UTL_HTTP.SET_HEADER(l_req, 'Auth-Key', p_auth_key);
+        END IF;
+
+        IF p_payload IS NOT NULL THEN
+            UTL_HTTP.SET_HEADER(l_req, 'Content-Length', TO_CHAR(DBMS_LOB.GETLENGTH(p_payload)));
+            UTL_HTTP.WRITE_TEXT(l_req, p_payload);
+        END IF;
+
+        l_resp := UTL_HTTP.GET_RESPONSE(l_req);
+
+        IF l_resp.status_code <> 200 THEN
+            DBMS_LOB.CREATETEMPORARY(l_body, TRUE);
+
+            BEGIN
+                LOOP
+                    UTL_HTTP.READ_TEXT(l_resp, l_buffer, 32767);
+                    DBMS_LOB.WRITEAPPEND(l_body, LENGTH(l_buffer), l_buffer);
+                END LOOP;
+            EXCEPTION
+                WHEN UTL_HTTP.END_OF_BODY THEN
+                    NULL;
+            END;
+
+            UTL_HTTP.END_RESPONSE(l_resp);
+
+            RAISE_APPLICATION_ERROR(
+                -20002,
+                'HTTP call failed. URL=' || p_url ||
+                ' status=' || l_resp.status_code ||
+                ' body=' || DBMS_LOB.SUBSTR(l_body, 1000, 1)
+            );
+        END IF;
+
+        DBMS_LOB.CREATETEMPORARY(l_body, TRUE);
+
+        BEGIN
+            LOOP
+                UTL_HTTP.READ_TEXT(l_resp, l_buffer, 32767);
+                DBMS_LOB.WRITEAPPEND(l_body, LENGTH(l_buffer), l_buffer);
+            END LOOP;
+        EXCEPTION
+            WHEN UTL_HTTP.END_OF_BODY THEN
+                NULL;
+        END;
+
+        UTL_HTTP.END_RESPONSE(l_resp);
+        RETURN l_body;
+    EXCEPTION
+        WHEN OTHERS THEN
+            BEGIN
+                UTL_HTTP.END_RESPONSE(l_resp);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    NULL;
+            END;
+            RAISE;
+    END get_http_clob;
+
+    PROCEDURE sync_threatfox IS
+        l_url           VARCHAR2(4000);
+        l_days          NUMBER;
+        l_auth_key      VARCHAR2(4000);
+        l_payload       CLOB;
+        l_body          CLOB;
+        l_query_status  VARCHAR2(50);
+        l_rows_merged   NUMBER := 0;
+    BEGIN
+        l_url      := get_config('ABUSECH_THREATFOX_URL');
+        l_auth_key := get_config('THREATFOX_AUTH_KEY');
+        l_days     := TO_NUMBER(get_config('THREATFOX_DAYS'));
+
+        IF l_days < 1 OR l_days > 7 THEN
+            RAISE_APPLICATION_ERROR(-20004, 'THREATFOX_DAYS must be between 1 and 7');
+        END IF;
+
+        l_payload := '{"query":"get_iocs","days":' || l_days || '}';
+
+        l_body := get_http_clob(
+            p_url         => l_url,
+            p_method      => 'POST',
+            p_contenttype => 'application/json',
+            p_payload     => l_payload,
+            p_auth_key    => l_auth_key
+        );
+
+        SELECT jt.query_status
+        INTO   l_query_status
+        FROM   JSON_TABLE(
+                   l_body,
+                   '$'
+                   COLUMNS (
+                       query_status VARCHAR2(50) PATH '$.query_status'
+                   )
+               ) jt;
+
+        IF l_query_status = 'no_results' THEN
+            write_log('CTI_SYNC', 'ABUSECH_THREATFOX', 'SUCCESS', 0, 'No results returned');
+            RETURN;
+        ELSIF l_query_status <> 'ok' THEN
+            RAISE_APPLICATION_ERROR(-20003, 'ThreatFox query_status=' || l_query_status);
+        END IF;
+
+        MERGE INTO cti_iocs t
+        USING (
+            SELECT
+                'IPv4' AS indicator_type,
+                CASE
+                    WHEN INSTR(jt.ioc_value, ':') > 0
+                    THEN SUBSTR(jt.ioc_value, 1, INSTR(jt.ioc_value, ':') - 1)
+                    ELSE jt.ioc_value
+                END AS indicator_value,
+                'ABUSECH_THREATFOX' AS source_name,
+                'THREATFOX-' || jt.ioc_id AS source_key,
+                jt.ioc_id AS pulse_id,
+                jt.malware_printable AS pulse_name,
+                jt.threat_type_desc AS description,
+                jt.confidence_level AS threat_score,
+                CASE
+                    WHEN jt.first_seen IS NOT NULL
+                    THEN TO_TIMESTAMP(REPLACE(jt.first_seen, ' UTC', ''), 'YYYY-MM-DD HH24:MI:SS')
+                END AS first_seen,
+                CASE
+                    WHEN jt.last_seen IS NOT NULL
+                    THEN TO_TIMESTAMP(REPLACE(jt.last_seen, ' UTC', ''), 'YYYY-MM-DD HH24:MI:SS')
+                    WHEN jt.first_seen IS NOT NULL
+                    THEN TO_TIMESTAMP(REPLACE(jt.first_seen, ' UTC', ''), 'YYYY-MM-DD HH24:MI:SS')
+                    ELSE SYSTIMESTAMP
+                END AS last_seen,
+                'Y' AS is_active,
+                JSON_OBJECT(
+                    'id' VALUE jt.ioc_id,
+                    'ioc' VALUE jt.ioc_value,
+                    'ioc_type' VALUE jt.ioc_type,
+                    'malware_printable' VALUE jt.malware_printable,
+                    'threat_type_desc' VALUE jt.threat_type_desc,
+                    'confidence_level' VALUE jt.confidence_level,
+                    'first_seen' VALUE jt.first_seen,
+                    'last_seen' VALUE jt.last_seen
+                    RETURNING CLOB
+                ) AS raw_json
+            FROM JSON_TABLE(
+                     l_body,
+                     '$.data[*]'
+                     COLUMNS (
+                         ioc_id            VARCHAR2(100)  PATH '$.id',
+                         ioc_value         VARCHAR2(200)  PATH '$.ioc',
+                         ioc_type          VARCHAR2(50)   PATH '$.ioc_type',
+                         malware_printable VARCHAR2(500)  PATH '$.malware_printable',
+                         threat_type_desc  VARCHAR2(2000) PATH '$.threat_type_desc',
+                         confidence_level  NUMBER         PATH '$.confidence_level',
+                         first_seen        VARCHAR2(50)   PATH '$.first_seen',
+                         last_seen         VARCHAR2(50)   PATH '$.last_seen'
+                     )
+                 ) jt
+            WHERE jt.ioc_type = 'ip:port'
+              AND jt.ioc_value IS NOT NULL
+              AND REGEXP_LIKE(
+                    CASE
+                        WHEN INSTR(jt.ioc_value, ':') > 0
+                        THEN SUBSTR(jt.ioc_value, 1, INSTR(jt.ioc_value, ':') - 1)
+                        ELSE jt.ioc_value
+                    END,
+                    '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                  )
+        ) s
+        ON (t.source_name = s.source_name AND t.source_key = s.source_key)
+        WHEN MATCHED THEN
+            UPDATE SET
+                t.indicator_type  = s.indicator_type,
+                t.indicator_value = s.indicator_value,
+                t.pulse_id        = s.pulse_id,
+                t.pulse_name      = s.pulse_name,
+                t.description     = s.description,
+                t.threat_score    = s.threat_score,
+                t.first_seen      = COALESCE(t.first_seen, s.first_seen),
+                t.last_seen       = s.last_seen,
+                t.is_active       = s.is_active,
+                t.raw_json        = s.raw_json,
+                t.updated_at      = SYSTIMESTAMP
+        WHEN NOT MATCHED THEN
+            INSERT (
+                indicator_type, indicator_value, source_name, source_key,
+                pulse_id, pulse_name, description, threat_score,
+                first_seen, last_seen, is_active, raw_json,
+                created_at, updated_at
+            )
+            VALUES (
+                s.indicator_type, s.indicator_value, s.source_name, s.source_key,
+                s.pulse_id, s.pulse_name, s.description, s.threat_score,
+                s.first_seen, s.last_seen, s.is_active, s.raw_json,
+                SYSTIMESTAMP, SYSTIMESTAMP
+            );
+
+        l_rows_merged := SQL%ROWCOUNT;
+        COMMIT;
+
+        write_log('CTI_SYNC', 'ABUSECH_THREATFOX', 'SUCCESS', l_rows_merged,
+                  'ThreatFox sync completed');
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            write_log('CTI_SYNC', 'ABUSECH_THREATFOX', 'FAILED', 0, SQLERRM);
+            RAISE;
+    END sync_threatfox;
+
+    PROCEDURE sync_feodo IS
+        l_url         VARCHAR2(4000);
+        l_body        CLOB;
+        l_rows_merged NUMBER := 0;
+    BEGIN
+        l_url := get_config('ABUSECH_FEODO_URL');
+
+        l_body := get_http_clob(
+            p_url    => l_url,
+            p_method => 'GET'
+        );
+
+        MERGE INTO cti_iocs t
+        USING (
+            SELECT
+                'IPv4' AS indicator_type,
+                jt.ip_address AS indicator_value,
+                'ABUSECH_FEODO' AS source_name,
+                'FEODO-' || jt.ip_address || '-' || jt.port AS source_key,
+                'FEODO-' || jt.ip_address || '-' || jt.port AS pulse_id,
+                NVL(jt.malware, 'Feodo') AS pulse_name,
+                'Botnet C2 | Port: ' || jt.port ||
+                ' | AS: ' || NVL(jt.as_name, 'unknown') ||
+                ' | Country: ' || NVL(jt.country, 'unknown') AS description,
+                85 AS threat_score,
+                CASE
+                    WHEN jt.first_seen IS NOT NULL
+                    THEN TO_TIMESTAMP(jt.first_seen, 'YYYY-MM-DD HH24:MI:SS')
+                END AS first_seen,
+                CASE
+                    WHEN jt.last_online IS NOT NULL
+                    THEN TO_TIMESTAMP(jt.last_online, 'YYYY-MM-DD HH24:MI:SS')
+                    WHEN jt.first_seen IS NOT NULL
+                    THEN TO_TIMESTAMP(jt.first_seen, 'YYYY-MM-DD HH24:MI:SS')
+                    ELSE SYSTIMESTAMP
+                END AS last_seen,
+                CASE
+                    WHEN LOWER(jt.status) = 'online' THEN 'Y'
+                    ELSE 'N'
+                END AS is_active,
+                JSON_OBJECT(
+                    'ip_address' VALUE jt.ip_address,
+                    'port' VALUE jt.port,
+                    'status' VALUE jt.status,
+                    'as_name' VALUE jt.as_name,
+                    'country' VALUE jt.country,
+                    'first_seen' VALUE jt.first_seen,
+                    'last_online' VALUE jt.last_online,
+                    'malware' VALUE jt.malware
+                    RETURNING CLOB
+                ) AS raw_json
+            FROM JSON_TABLE(
+                     l_body,
+                     '$[*]'
+                     COLUMNS (
+                         ip_address  VARCHAR2(50)  PATH '$.ip_address',
+                         port        VARCHAR2(10)  PATH '$.port',
+                         status      VARCHAR2(20)  PATH '$.status',
+                         as_name     VARCHAR2(500) PATH '$.as_name',
+                         country     VARCHAR2(50)  PATH '$.country',
+                         first_seen  VARCHAR2(50)  PATH '$.first_seen',
+                         last_online VARCHAR2(50)  PATH '$.last_online',
+                         malware     VARCHAR2(200) PATH '$.malware'
+                     )
+                 ) jt
+            WHERE jt.ip_address IS NOT NULL
+              AND REGEXP_LIKE(jt.ip_address, '^[0-9]{1,3}(\.[0-9]{1,3}){3}$')
+        ) s
+        ON (t.source_name = s.source_name AND t.source_key = s.source_key)
+        WHEN MATCHED THEN
+            UPDATE SET
+                t.indicator_type  = s.indicator_type,
+                t.indicator_value = s.indicator_value,
+                t.pulse_id        = s.pulse_id,
+                t.pulse_name      = s.pulse_name,
+                t.description     = s.description,
+                t.threat_score    = s.threat_score,
+                t.first_seen      = COALESCE(t.first_seen, s.first_seen),
+                t.last_seen       = s.last_seen,
+                t.is_active       = s.is_active,
+                t.raw_json        = s.raw_json,
+                t.updated_at      = SYSTIMESTAMP
+        WHEN NOT MATCHED THEN
+            INSERT (
+                indicator_type, indicator_value, source_name, source_key,
+                pulse_id, pulse_name, description, threat_score,
+                first_seen, last_seen, is_active, raw_json,
+                created_at, updated_at
+            )
+            VALUES (
+                s.indicator_type, s.indicator_value, s.source_name, s.source_key,
+                s.pulse_id, s.pulse_name, s.description, s.threat_score,
+                s.first_seen, s.last_seen, s.is_active, s.raw_json,
+                SYSTIMESTAMP, SYSTIMESTAMP
+            );
+
+        l_rows_merged := SQL%ROWCOUNT;
+        COMMIT;
+
+        write_log('CTI_SYNC', 'ABUSECH_FEODO', 'SUCCESS', l_rows_merged,
+                  'Feodo sync completed');
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            write_log('CTI_SYNC', 'ABUSECH_FEODO', 'FAILED', 0, SQLERRM);
+            RAISE;
+    END sync_feodo;
+
+    PROCEDURE sync_all IS
+    BEGIN
+        sync_threatfox;
+        sync_feodo;
+    END sync_all;
+
+END cti_abusech_pkg;
+/
+
+BEGIN
+    cti_abusech_pkg.sync_all;
+END;
+/
+
+SELECT source_name, COUNT(*) cnt
+FROM cti_iocs
+GROUP BY source_name
+ORDER BY source_name;
+
+
+
+
+
